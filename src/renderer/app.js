@@ -356,11 +356,19 @@ function setupEventListeners() {
         if (elements.refreshBtn) elements.refreshBtn.classList.remove('spinning');
     });
 
-    // Listen for session expiration events (403 errors)
+    // Listen for session expiration events (401/403, or a Cloudflare block).
+    // The silent-refresh levels in main.js already had their chance before
+    // this fires, so getting here means reconnecting genuinely needs the
+    // user's session (interactive re-auth, e.g. MFA) — offer it immediately
+    // instead of leaving the widget silently stuck on stale data. This reuses
+    // the same auto-detect flow as a first-time login: if the underlying
+    // claude.ai session actually is still alive, it resolves near-instantly
+    // without the user noticing anything beyond the button's "Waiting..." text.
     window.electronAPI.onSessionExpired(() => {
         debugLog('Session expired event received');
         credentials = { sessionKey: null, organizationId: null };
         showLoginRequired();
+        handleAutoDetect();
     });
 
     // Update banner
@@ -479,7 +487,8 @@ async function handleAutoDetect() {
             credentials = {
                 sessionKey: result.sessionKey,
                 organizationId: validation.organizationId,
-                organizations: validation.organizations || []
+                organizations: validation.organizations || [],
+                expirationDate: result.expirationDate
             };
             await window.electronAPI.saveCredentials(credentials);
             populateOrgSelector(validation.organizations || [], validation.organizationId);

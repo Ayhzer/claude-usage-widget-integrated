@@ -52,6 +52,17 @@ function debugLog(...args) {
 
 const CHROME_USER_AGENT = 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36';
 
+// Domains a login/re-auth window is allowed to navigate to — claude.ai plus
+// its supported OAuth/SSO providers. Shared by every window that drives an
+// authentication flow (visible login window, silent refresh window) so the
+// allowlist can't drift between them.
+const ALLOWED_LOGIN_DOMAINS = [
+  'claude.ai',
+  'accounts.google.com',
+  'appleid.apple.com',
+  'login.microsoftonline.com'
+];
+
 let mainWindow = null;
 let sessionTray = null;  // Tray icon for Session usage
 let weeklyTray = null;   // Tray icon for Weekly usage
@@ -138,8 +149,79 @@ app.on('ready', () => {
   session.defaultSession.setUserAgent(CHROME_USER_AGENT);
 });
 
+// Persist a sessionKey captured from any source (login window, or a live
+// Set-Cookie rotation from claude.ai) using the same encrypted storage as
+// save-credentials, so it survives restarts and stays in sync with whatever
+// claude.ai's browser session currently holds.
+function persistSessionKey(sessionKey, expirationDate) {
+  if (safeStorage.isEncryptionAvailable()) {
+    const encrypted = safeStorage.encryptString(sessionKey);
+    store.set('sessionKey_encrypted', encrypted.toString('base64'));
+    store.delete('sessionKey');
+  } else {
+    store.set('sessionKey', sessionKey);
+  }
+  if (expirationDate) {
+    store.set('sessionKeyExpiresAt', expirationDate);
+  }
+}
+
+// How long before the stored sessionKey's known expiration we attempt a
+// silent refresh (level 3 of the reconnection cascade). Chosen as an
+// absolute margin rather than a percentage of total lifetime: Electron only
+// gives us the expiration timestamp, not when the cookie was issued, so a
+// "90% of lifetime" rule would need extra bookkeeping for no real benefit —
+// a fixed margin catches the 24h org-enforced expiry just as well.
+const SESSION_KEY_REFRESH_MARGIN_MS = 30 * 60 * 1000;
+
+// Read the stored sessionKey back out, decrypting it if safeStorage holds
+// it. Centralizes what was previously four separate copies of the same
+// safeStorage-or-legacy-plaintext lookup, each free to drift from the others.
+function loadStoredSessionKey() {
+  if (safeStorage.isEncryptionAvailable()) {
+    const encrypted = store.get('sessionKey_encrypted');
+    if (!encrypted) return null;
+    try {
+      return safeStorage.decryptString(Buffer.from(encrypted, 'base64'));
+    } catch (err) {
+      console.error('[Keychain] Failed to decrypt session key:', err.message);
+      return null;
+    }
+  }
+  return store.get('sessionKey') || null;
+}
+
+// True once the stored sessionKey is within its refresh margin of expiring,
+// or already past it. False when no expiration is known — cookies set via
+// the manual paste flow don't carry one, so there is nothing to anticipate.
+function isSessionKeyNearExpiry() {
+  const expiresAt = store.get('sessionKeyExpiresAt'); // epoch seconds (Electron cookie format)
+  if (!expiresAt) return false;
+  return (expiresAt * 1000) - Date.now() <= SESSION_KEY_REFRESH_MARGIN_MS;
+}
+
+// Capture sessionKey rotations claude.ai performs on its own (a silent
+// Set-Cookie refresh while the app is running) as soon as they happen.
+// Without this, the next fetch-usage-data call would read the *stale*
+// value from the store and overwrite the freshly-rotated cookie with it —
+// undoing a renewal that had already succeeded.
+app.on('ready', () => {
+  session.defaultSession.cookies.on('changed', (event, cookie, cause, removed) => {
+    if (cookie.name === 'sessionKey' && cookie.domain.includes('claude.ai') && !removed && cookie.value) {
+      persistSessionKey(cookie.value, cookie.expirationDate);
+      debugLog('sessionKey cookie rotation captured, cause:', cause);
+    }
+  });
+});
+
 // Set sessionKey as a cookie in Electron's session
 async function setSessionCookie(sessionKey) {
+  const existing = await session.defaultSession.cookies.get({ url: 'https://claude.ai', name: 'sessionKey' });
+  if (existing.length && existing[0].value === sessionKey) {
+    // Already the current value — skip the redundant write so we don't
+    // clobber a rotation that just landed via the listener above.
+    return;
+  }
   await session.defaultSession.cookies.set({
     url: 'https://claude.ai',
     name: 'sessionKey',
@@ -150,6 +232,18 @@ async function setSessionCookie(sessionKey) {
     httpOnly: true
   });
   debugLog('sessionKey cookie set in Electron session');
+}
+
+// Remove the stored sessionKey from every location it can live in — legacy
+// plaintext, safeStorage-encrypted, and the organizationId that pairs with it.
+// A logout or expired-session cleanup that only clears one of these leaves
+// the encrypted key in place, so it silently comes back on the next launch
+// (main.js's startup credential load reads sessionKey_encrypted first).
+function clearStoredCredentials() {
+  store.delete('sessionKey');
+  store.delete('sessionKey_encrypted');
+  store.delete('organizationId');
+  store.delete('sessionKeyExpiresAt');
 }
 
 function createMainWindow() {
@@ -594,8 +688,7 @@ function createTray() {
       {
         label: 'Log Out',
         click: async () => {
-          store.delete('sessionKey');
-          store.delete('organizationId');
+          clearStoredCredentials();
           // Clear all Claude.ai cookies and session storage
           const cookies = await session.defaultSession.cookies.get({ url: 'https://claude.ai' });
           for (const cookie of cookies) {
@@ -797,37 +890,15 @@ function updateTrayIcon(usageData) {
 
 // IPC Handlers
 ipcMain.handle('get-credentials', () => {
-  let sessionKey = null;
-  // Try safeStorage first (OS keychain)
-  if (safeStorage.isEncryptionAvailable()) {
-    const encrypted = store.get('sessionKey_encrypted');
-    if (encrypted) {
-      try {
-        sessionKey = safeStorage.decryptString(Buffer.from(encrypted, 'base64'));
-      } catch (err) {
-        console.error('[Keychain] Failed to decrypt session key:', err.message);
-      }
-    }
-  } else {
-    // Fallback: plain storage (legacy or safeStorage unavailable)
-    sessionKey = store.get('sessionKey');
-  }
+  const sessionKey = loadStoredSessionKey();
   return {
     sessionKey,
     organizationId: store.get('organizationId')
   };
 });
 
-ipcMain.handle('save-credentials', async (event, { sessionKey, organizationId }) => {
-  // Store session key in OS keychain if available
-  if (safeStorage.isEncryptionAvailable()) {
-    const encrypted = safeStorage.encryptString(sessionKey);
-    store.set('sessionKey_encrypted', encrypted.toString('base64'));
-    store.delete('sessionKey'); // Remove legacy plain storage
-  } else {
-    // Fallback: plain storage
-    store.set('sessionKey', sessionKey);
-  }
+ipcMain.handle('save-credentials', async (event, { sessionKey, organizationId, expirationDate }) => {
+  persistSessionKey(sessionKey, expirationDate);
   if (organizationId) {
     store.set('organizationId', organizationId);
   }
@@ -837,9 +908,7 @@ ipcMain.handle('save-credentials', async (event, { sessionKey, organizationId })
 });
 
 ipcMain.handle('delete-credentials', async () => {
-  store.delete('sessionKey');
-  store.delete('sessionKey_encrypted');
-  store.delete('organizationId');
+  clearStoredCredentials();
   // Remove all Claude.ai cookies
   const cookies = await session.defaultSession.cookies.get({ url: 'https://claude.ai' });
   for (const cookie of cookies) {
@@ -856,7 +925,6 @@ ipcMain.handle('delete-credentials', async () => {
 
 // Validate a sessionKey by fetching org ID via hidden BrowserWindow
 ipcMain.handle('validate-session-key', async (event, sessionKey) => {
-  debugLog('Validating session key:', sessionKey.substring(0, 20) + '...');
   try {
     // Set the cookie in Electron's session first
     await setSessionCookie(sessionKey);
@@ -1079,6 +1147,63 @@ ipcMain.handle('save-settings', (event, settings) => {
   return true;
 });
 
+// Level 3 of the reconnection cascade: try to renew the sessionKey without
+// ever showing a window. Loads claude.ai's login page in a hidden
+// BrowserWindow — if the underlying claude.ai/IdP session is still alive,
+// the page redirects straight past /login and drops a fresh sessionKey
+// cookie, captured automatically by the permanent 'changed' listener above.
+// If a login form is shown instead (MFA required, IdP session also dead),
+// we give up silently; the caller falls back to the interactive
+// detect-session-key window (level 4).
+function attemptSilentRefresh({ timeoutMs = 8000 } = {}) {
+  return new Promise((resolve) => {
+    const win = new BrowserWindow({
+      show: false,
+      webPreferences: {
+        nodeIntegration: false,
+        contextIsolation: true
+      }
+    });
+
+    let settled = false;
+    const finish = (success) => {
+      if (settled) return;
+      settled = true;
+      clearTimeout(timer);
+      if (!win.isDestroyed()) win.close();
+      resolve({ success });
+    };
+
+    const timer = setTimeout(() => finish(false), timeoutMs);
+
+    win.webContents.on('will-navigate', (event, url) => {
+      try {
+        const hostname = new URL(url).hostname;
+        const isAllowed = ALLOWED_LOGIN_DOMAINS.some(domain =>
+          hostname === domain || hostname.endsWith('.' + domain)
+        );
+        if (!isAllowed) event.preventDefault();
+      } catch {
+        event.preventDefault();
+      }
+    });
+
+    win.webContents.setWindowOpenHandler(() => ({ action: 'deny' }));
+
+    // Any navigation that lands away from /login means the IdP session was
+    // still valid and claude.ai let us straight through.
+    const checkUrl = (event, url) => {
+      if (!url.includes('/login')) finish(true);
+    };
+    win.webContents.on('did-navigate', checkUrl);
+    win.webContents.on('did-navigate-in-page', checkUrl);
+
+    win.webContents.on('did-fail-load', () => finish(false));
+
+    win.loadURL('https://claude.ai/login').catch(() => finish(false));
+  });
+}
+
 // Open a visible BrowserWindow for the user to log in to Claude.ai.
 //
 // Why we don't embed login directly in the app:
@@ -1092,11 +1217,13 @@ ipcMain.handle('save-settings', (event, settings) => {
 // providers) to prevent phishing attacks. Popup windows are blocked. Current
 // URL is displayed in the window title bar for transparency.
 ipcMain.handle('detect-session-key', async () => {
-  // Clear any leftover sessionKey cookie
-  try {
-    await session.defaultSession.cookies.remove('https://claude.ai', 'sessionKey');
-  } catch (e) { /* ignore */ }
-
+  // Intentionally does NOT clear the existing sessionKey cookie before
+  // opening the window (see constat 2.4 in PLAN.md): if the underlying
+  // claude.ai/IdP session is still alive, loading /login redirects straight
+  // through and a fresh cookie is captured below without the user having to
+  // do anything. Clearing first would force a full interactive re-auth even
+  // when it isn't needed. If the session really is dead, claude.ai ignores
+  // the stale cookie server-side and shows the login form as normal.
   return new Promise((resolve) => {
     const loginWin = new BrowserWindow({
       width: 1000,
@@ -1110,18 +1237,10 @@ ipcMain.handle('detect-session-key', async () => {
 
     let resolved = false;
 
-    // Security: restrict navigation to trusted domains only
-    const allowedLoginDomains = [
-      'claude.ai',
-      'accounts.google.com',
-      'appleid.apple.com',
-      'login.microsoftonline.com'
-    ];
-
     loginWin.webContents.on('will-navigate', (event, url) => {
       try {
         const hostname = new URL(url).hostname;
-        const isAllowed = allowedLoginDomains.some(domain =>
+        const isAllowed = ALLOWED_LOGIN_DOMAINS.some(domain =>
           hostname === domain || hostname.endsWith('.' + domain)
         );
         if (!isAllowed) {
@@ -1163,7 +1282,7 @@ ipcMain.handle('detect-session-key', async () => {
         resolved = true;
         session.defaultSession.cookies.removeListener('changed', onCookieChanged);
         loginWin.close();
-        resolve({ success: true, sessionKey: cookie.value });
+        resolve({ success: true, sessionKey: cookie.value, expirationDate: cookie.expirationDate });
       }
     };
 
@@ -1250,25 +1369,25 @@ function isNewerVersion(remote, local) {
 }
 
 ipcMain.handle('fetch-usage-data', async (event, options = {}) => {
-  // Use the same credential retrieval logic as get-credentials
-  let sessionKey = null;
-  if (safeStorage.isEncryptionAvailable()) {
-    const encrypted = store.get('sessionKey_encrypted');
-    if (encrypted) {
-      try {
-        sessionKey = safeStorage.decryptString(Buffer.from(encrypted, 'base64'));
-      } catch (err) {
-        console.error('[Keychain] Failed to decrypt session key:', err.message);
-      }
-    }
-  } else {
-    sessionKey = store.get('sessionKey');
-  }
-
+  let sessionKey = loadStoredSessionKey();
   const organizationId = store.get('organizationId');
 
   if (!sessionKey || !organizationId) {
     throw new Error('Missing credentials');
+  }
+
+  // Anticipate the 24h org-enforced expiry: try a silent renewal before it
+  // actually lapses, so the fetch below runs against a fresh cookie instead
+  // of failing first and only reacting afterwards.
+  if (isSessionKeyNearExpiry()) {
+    try {
+      await attemptSilentRefresh();
+    } catch (err) {
+      debugLog('Silent session refresh attempt failed:', err.message);
+    }
+    // Re-read whatever is now stored — attemptSilentRefresh, if successful,
+    // persisted a fresh key via the permanent cookie listener.
+    sessionKey = loadStoredSessionKey();
   }
 
   // Ensure cookie is set
@@ -1329,10 +1448,10 @@ ipcMain.handle('fetch-usage-data', async (event, options = {}) => {
     debugLog('API request failed:', error.message);
     const isBlocked = error.message.startsWith('CloudflareBlocked')
       || error.message.startsWith('CloudflareChallenge')
-      || error.message.startsWith('UnexpectedHTML');
+      || error.message.startsWith('UnexpectedHTML')
+      || error.message.startsWith('Unauthorized');
     if (isBlocked) {
-      store.delete('sessionKey');
-      store.delete('organizationId');
+      clearStoredCredentials();
       if (mainWindow) {
         mainWindow.webContents.send('session-expired');
       }
@@ -1408,19 +1527,7 @@ ipcMain.handle('fetch-usage-data', async (event, options = {}) => {
 // App lifecycle
 app.whenReady().then(async () => {
   // Restore session cookie if we have stored credentials
-  let sessionKey = null;
-  if (safeStorage.isEncryptionAvailable()) {
-    const encrypted = store.get('sessionKey_encrypted');
-    if (encrypted) {
-      try {
-        sessionKey = safeStorage.decryptString(Buffer.from(encrypted, 'base64'));
-      } catch (err) {
-        console.error('[Keychain] Failed to decrypt session key on startup:', err.message);
-      }
-    }
-  } else {
-    sessionKey = store.get('sessionKey');
-  }
+  const sessionKey = loadStoredSessionKey();
 
   if (sessionKey) {
     await setSessionCookie(sessionKey);
