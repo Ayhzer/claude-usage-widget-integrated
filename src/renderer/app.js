@@ -31,6 +31,8 @@ const elements = {
     mainContent: document.getElementById('mainContent'),
     loginStep1: document.getElementById('loginStep1'),
     loginStep2: document.getElementById('loginStep2'),
+    renewEdgeBtn: document.getElementById('renewEdgeBtn'),
+    renewEdgeError: document.getElementById('renewEdgeError'),
     autoDetectBtn: document.getElementById('autoDetectBtn'),
     autoDetectError: document.getElementById('autoDetectError'),
     openBrowserLink: document.getElementById('openBrowserLink'),
@@ -215,7 +217,12 @@ async function init() {
 
 // Event Listeners
 function setupEventListeners() {
-    // Step 1: Login via BrowserWindow
+    // Step 1: Login via a real external Edge, session key captured over CDP
+    elements.renewEdgeBtn.addEventListener('click', handleRenewViaEdge);
+
+    // Step 1 fallback: login via the embedded BrowserWindow (Claude.ai/Cloudflare
+    // often blocks this one — kept only in case the Edge/CDP path is unavailable,
+    // e.g. an enterprise policy disabling --remote-debugging-port).
     elements.autoDetectBtn.addEventListener('click', handleAutoDetect);
 
     // Step navigation
@@ -359,16 +366,14 @@ function setupEventListeners() {
     // Listen for session expiration events (401/403, or a Cloudflare block).
     // The silent-refresh levels in main.js already had their chance before
     // this fires, so getting here means reconnecting genuinely needs the
-    // user's session (interactive re-auth, e.g. MFA) — offer it immediately
-    // instead of leaving the widget silently stuck on stale data. This reuses
-    // the same auto-detect flow as a first-time login: if the underlying
-    // claude.ai session actually is still alive, it resolves near-instantly
-    // without the user noticing anything beyond the button's "Waiting..." text.
+    // user's session (interactive re-auth, e.g. MFA). Show the login screen
+    // with "Renew in Edge" as the primary action, but don't launch anything
+    // automatically — opening an external browser window without a click
+    // would be surprising.
     window.electronAPI.onSessionExpired(() => {
         debugLog('Session expired event received');
         credentials = { sessionKey: null, organizationId: null };
         showLoginRequired();
-        handleAutoDetect();
     });
 
     // Update banner
@@ -463,6 +468,48 @@ async function handleConnect() {
     } finally {
         elements.connectBtn.disabled = false;
         elements.connectBtn.textContent = 'Connect';
+    }
+}
+
+// Handle session renewal via a real external Edge, session key captured
+// automatically over the DevTools Protocol — no manual copy-paste.
+async function handleRenewViaEdge() {
+    elements.renewEdgeBtn.disabled = true;
+    elements.renewEdgeBtn.textContent = 'Opening Edge...';
+    elements.renewEdgeError.textContent = '';
+    elements.autoDetectError.textContent = '';
+
+    try {
+        const result = await window.electronAPI.renewViaEdge();
+        if (!result.success) {
+            elements.renewEdgeError.textContent = result.error || 'Renewal failed';
+            return;
+        }
+
+        elements.renewEdgeBtn.textContent = 'Validating...';
+        const validation = await window.electronAPI.validateSessionKey(result.sessionKey);
+
+        if (validation.success) {
+            credentials = {
+                sessionKey: result.sessionKey,
+                organizationId: validation.organizationId,
+                organizations: validation.organizations || [],
+                expirationDate: result.expirationDate
+            };
+            await window.electronAPI.saveCredentials(credentials);
+            populateOrgSelector(validation.organizations || [], validation.organizationId);
+            showMainContent();
+            await fetchUsageData();
+            startAutoUpdate();
+        } else {
+            elements.renewEdgeError.textContent =
+                'Session invalid. Try again or use Manual →';
+        }
+    } catch (error) {
+        elements.renewEdgeError.textContent = error.message || 'Renewal failed';
+    } finally {
+        elements.renewEdgeBtn.disabled = false;
+        elements.renewEdgeBtn.textContent = 'Renew in Edge';
     }
 }
 

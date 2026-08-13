@@ -71,10 +71,12 @@
                         <div class="step-text">
                             <h3>Connect to Claude.ai</h3>
                             <p>Log in to your Claude account</p>
-                            <p class="step-hint">If auto-login doesn't work, use Manual to paste your session key — Claude.ai may block embedded browsers.</p>
+                            <p class="step-hint">Opens Microsoft Edge to log in — the session key is captured automatically, no copy-paste needed.</p>
+                            <p class="step-error" id="renewEdgeError"></p>
+                            <button class="back-step-btn" id="autoDetectBtn">Try built-in window instead</button>
                             <p class="step-error" id="autoDetectError"></p>
                         </div>
-                        <button class="auto-detect-btn" id="autoDetectBtn">Log in</button>
+                        <button class="auto-detect-btn" id="renewEdgeBtn">Renew in Edge</button>
                         <button class="next-step-btn" id="nextStepBtn">Manual →</button>
                     </div>
 

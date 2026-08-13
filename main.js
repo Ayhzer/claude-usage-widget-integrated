@@ -1,6 +1,10 @@
 const { app, BrowserWindow, ipcMain, Tray, Menu, session, shell, Notification, safeStorage, nativeImage } = require('electron');
 const path = require('path');
 const https = require('https');
+const http = require('http');
+const net = require('net');
+const { spawn } = require('child_process');
+const WebSocket = require('ws');
 const Store = require('electron-store');
 const { fetchViaWindow, fetchMultipleViaWindow } = require('./src/fetch-via-window');
 
@@ -1153,8 +1157,8 @@ ipcMain.handle('save-settings', (event, settings) => {
 // the page redirects straight past /login and drops a fresh sessionKey
 // cookie, captured automatically by the permanent 'changed' listener above.
 // If a login form is shown instead (MFA required, IdP session also dead),
-// we give up silently; the caller falls back to the interactive
-// detect-session-key window (level 4).
+// we give up silently; the caller falls back to the interactive renewal
+// flows below (level 4a: real-Edge CDP, level 4b: embedded window).
 function attemptSilentRefresh({ timeoutMs = 8000 } = {}) {
   return new Promise((resolve) => {
     const win = new BrowserWindow({
@@ -1203,6 +1207,241 @@ function attemptSilentRefresh({ timeoutMs = 8000 } = {}) {
     win.loadURL('https://claude.ai/login').catch(() => finish(false));
   });
 }
+
+// Level 4a of the reconnection cascade: renew the sessionKey through a real,
+// external Edge (or Chrome) instance instead of Electron's embedded Chromium.
+// Claude.ai/Cloudflare blocks the embedded login window below (level 4b) but
+// has no reason to flag a genuine, unmodified browser — the user
+// authenticates exactly as they would anyway (MFA included, nothing
+// bypassed). We only ever call the CDP Network domain to read the resulting
+// cookie, never Runtime.enable/Page.enable on the page itself — the usual
+// signal automation-detection scripts look for — so this doesn't add any
+// client-side fingerprint for Cloudflare to see.
+//
+// Deliberately NOT reading Edge/Chrome's cookie database directly: that was
+// tried extensively in this project's history (DPAPI decryption, SQLite
+// WAL/EBUSY file-lock issues, asar packaging) and abandoned as "too fragile
+// and OS-specific" — see src/fetch-via-window.js's header comment. Modern
+// Chromium also wraps that file in App-Bound Encryption specifically to stop
+// this kind of extraction; defeating it would reproduce an infostealer
+// technique, not a legitimate feature. --remote-debugging-port, by contrast,
+// is a sanctioned Chromium feature built for exactly this kind of automation
+// (Playwright/Puppeteer/Selenium all use it).
+const EDGE_RENEWAL_TIMEOUT_MS = 5 * 60 * 1000; // generous — covers a real MFA prompt
+const EDGE_CDP_READY_TIMEOUT_MS = 10000;
+
+function findRenewalBrowserExecutable() {
+  const programFiles = process.env['ProgramFiles'] || 'C:\\Program Files';
+  const programFilesX86 = process.env['ProgramFiles(x86)'] || 'C:\\Program Files (x86)';
+  const localAppData = process.env['LOCALAPPDATA'] || '';
+  const candidates = [
+    path.join(programFiles, 'Microsoft', 'Edge', 'Application', 'msedge.exe'),
+    path.join(programFilesX86, 'Microsoft', 'Edge', 'Application', 'msedge.exe'),
+    path.join(localAppData, 'Microsoft', 'Edge', 'Application', 'msedge.exe'),
+    path.join(programFiles, 'Google', 'Chrome', 'Application', 'chrome.exe'),
+    path.join(programFilesX86, 'Google', 'Chrome', 'Application', 'chrome.exe'),
+    path.join(localAppData, 'Google', 'Chrome', 'Application', 'chrome.exe')
+  ];
+  return candidates.find((candidate) => {
+    try {
+      return fs.existsSync(candidate);
+    } catch {
+      return false;
+    }
+  }) || null;
+}
+
+function getFreePort() {
+  return new Promise((resolve, reject) => {
+    const probe = net.createServer();
+    probe.on('error', reject);
+    probe.listen(0, '127.0.0.1', () => {
+      const { port } = probe.address();
+      probe.close(() => resolve(port));
+    });
+  });
+}
+
+function httpGetJson(url, timeoutMs) {
+  return new Promise((resolve, reject) => {
+    const req = http.get(url, { timeout: timeoutMs }, (res) => {
+      let body = '';
+      res.on('data', (chunk) => { body += chunk; });
+      res.on('end', () => {
+        try {
+          resolve(JSON.parse(body));
+        } catch (err) {
+          reject(err);
+        }
+      });
+    });
+    req.on('error', reject);
+    req.on('timeout', () => req.destroy(new Error('CDP endpoint request timed out')));
+  });
+}
+
+// Poll the CDP HTTP endpoint until the browser has finished starting up.
+async function waitForCdpVersionInfo(port, timeoutMs) {
+  const deadline = Date.now() + timeoutMs;
+  let lastError;
+  while (Date.now() < deadline) {
+    try {
+      return await httpGetJson(`http://127.0.0.1:${port}/json/version`, 1000);
+    } catch (err) {
+      lastError = err;
+      await new Promise((resolve) => setTimeout(resolve, 300));
+    }
+  }
+  throw lastError || new Error('CDP endpoint did not respond in time');
+}
+
+// Drive the CDP WebSocket from Node directly (the `ws` package), not from a
+// page inside Electron's own Chromium. That was the first approach tried —
+// it fails every time: a page's native WebSocket always sends an `Origin`
+// header, and Chromium's DevTools server rejects any WebSocket handshake
+// that carries one, precisely to stop a malicious webpage from hijacking a
+// locally running browser's remote-debugging port (DNS-rebinding style
+// attack). A bare, non-browser WebSocket client has no Origin header and
+// connects normally — which is exactly why Puppeteer/Playwright drive CDP
+// this way instead of from inside a browser tab.
+function pollSessionKeyViaCdp(webSocketDebuggerUrl, timeoutMs) {
+  return new Promise((resolve) => {
+    const ws = new WebSocket(webSocketDebuggerUrl);
+    let msgId = 1;
+    let settled = false;
+    let pollTimer = null;
+    const pending = new Map();
+
+    const finish = (value) => {
+      if (settled) return;
+      settled = true;
+      clearTimeout(overallTimeout);
+      if (pollTimer) clearInterval(pollTimer);
+      try { ws.close(); } catch {}
+      resolve(value);
+    };
+
+    const overallTimeout = setTimeout(() => finish({ success: false, error: 'timeout' }), timeoutMs);
+
+    function send(method, params) {
+      const id = msgId++;
+      return new Promise((res) => {
+        pending.set(id, res);
+        ws.send(JSON.stringify({ id, method, params: params || {} }));
+      });
+    }
+
+    ws.on('open', () => {
+      pollTimer = setInterval(async () => {
+        if (settled) return;
+        // Network.getCookies requires an attached page session — it doesn't
+        // exist on this session-less browser-level connection (CDP error
+        // -32601). Storage.getCookies is the one Cookie-reading method that
+        // does work at the browser level, which is why it's used here.
+        const reply = await send('Storage.getCookies', {});
+        if (reply && reply.error) {
+          finish({ success: false, error: `CDP: ${reply.error.message}` });
+          return;
+        }
+        const cookies = (reply && reply.cookies) || [];
+        const found = cookies.find((c) => c.name === 'sessionKey' && c.domain.includes('claude.ai') && c.value);
+        if (found) {
+          await send('Storage.clearCookies', {});
+          finish({
+            success: true,
+            sessionKey: found.value,
+            expirationDate: found.expires > 0 ? found.expires : null
+          });
+        }
+      }, 1000);
+    });
+
+    ws.on('message', (data) => {
+      const msg = JSON.parse(data.toString());
+      if (msg.id && pending.has(msg.id)) {
+        pending.get(msg.id)(msg.error ? { error: msg.error } : msg.result);
+        pending.delete(msg.id);
+      }
+    });
+
+    ws.on('error', () => finish({ success: false, error: 'CDP WebSocket error' }));
+    ws.on('close', () => finish({ success: false, error: 'CDP connection closed' }));
+  });
+}
+
+// Tracks the in-flight renewal (if any) so app quit / a second click can
+// clean up the external browser process and its temp profile deterministically.
+let activeEdgeRenewal = null;
+
+function cleanupEdgeRenewal(state) {
+  if (!state) return;
+  try {
+    if (!state.child.killed) state.child.kill();
+  } catch {}
+  try {
+    fs.rmSync(state.tmpDir, { recursive: true, force: true });
+  } catch (err) {
+    debugLog('[EdgeRenewal] Failed to remove temp profile:', err.message);
+  }
+  if (activeEdgeRenewal === state) activeEdgeRenewal = null;
+}
+
+async function attemptEdgeRenewal() {
+  if (activeEdgeRenewal) {
+    return { success: false, error: 'A renewal is already in progress' };
+  }
+
+  const browserPath = findRenewalBrowserExecutable();
+  if (!browserPath) {
+    return { success: false, error: 'Microsoft Edge introuvable — utilisez Manuel' };
+  }
+
+  const port = await getFreePort();
+  const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), 'claude-usage-widget-edge-'));
+  const child = spawn(browserPath, [
+    `--remote-debugging-port=${port}`,
+    `--user-data-dir=${tmpDir}`,
+    '--no-first-run',
+    '--no-default-browser-check',
+    'https://claude.ai/login'
+  ], { stdio: 'ignore' });
+
+  const state = { child, tmpDir };
+  activeEdgeRenewal = state;
+
+  let userClosedBrowser = false;
+  child.once('exit', (code, signal) => {
+    debugLog('[EdgeRenewal] child exited, code=', code, 'signal=', signal);
+    userClosedBrowser = true;
+  });
+  child.once('error', (err) => {
+    debugLog('[EdgeRenewal] child spawn error:', err.message);
+    userClosedBrowser = true;
+  });
+
+  try {
+    const versionInfo = await waitForCdpVersionInfo(port, EDGE_CDP_READY_TIMEOUT_MS);
+    const result = await pollSessionKeyViaCdp(versionInfo.webSocketDebuggerUrl, EDGE_RENEWAL_TIMEOUT_MS);
+    debugLog('[EdgeRenewal] renewal result:', result.success, result.error || '');
+
+    if (!result.success) {
+      return { success: false, error: userClosedBrowser ? 'Login window closed' : (result.error || 'Renewal failed') };
+    }
+
+    persistSessionKey(result.sessionKey, result.expirationDate);
+    return { success: true, sessionKey: result.sessionKey, expirationDate: result.expirationDate };
+  } catch (err) {
+    return { success: false, error: userClosedBrowser ? 'Login window closed' : err.message };
+  } finally {
+    cleanupEdgeRenewal(state);
+  }
+}
+
+app.on('before-quit', () => {
+  cleanupEdgeRenewal(activeEdgeRenewal);
+});
+
+ipcMain.handle('renew-via-edge', () => attemptEdgeRenewal());
 
 // Open a visible BrowserWindow for the user to log in to Claude.ai.
 //
