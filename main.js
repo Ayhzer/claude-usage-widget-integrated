@@ -7,6 +7,8 @@ const { spawn } = require('child_process');
 const WebSocket = require('ws');
 const Store = require('electron-store');
 const { fetchViaWindow, fetchMultipleViaWindow } = require('./src/fetch-via-window');
+const { toChatOrgSummaries, pickOrganizationId } = require('./src/org-selection');
+const { isEmptyUsagePayload, looksLikeWrongOrg } = require('./src/usage-payload');
 
 const GITHUB_OWNER = 'SlavomirDurej';
 const GITHUB_REPO = 'claude-usage-widget';
@@ -77,18 +79,32 @@ const HISTORY_RETENTION_DAYS = 8;
 const CHART_DAYS = 7;
 const MAX_HISTORY_SAMPLES = 10000; // Cap total samples to prevent unbounded growth
 
+// History is namespaced per organization; the bare key is the pre-migration
+// legacy one (see migrateUsageHistoryKey).
+function usageHistoryKey(organizationId) {
+  return organizationId ? `usageHistory_${organizationId}` : 'usageHistory';
+}
+
+// Whether this org has produced any usage the widget still holds. Bounded by
+// HISTORY_RETENTION_DAYS and by pruneStaleHistoryKeys, so it answers "recently"
+// rather than "ever" — which is the useful question: an org that was producing
+// samples until this morning is idle, not wrong.
+function orgHasUsageHistory(organizationId) {
+  return store.get(usageHistoryKey(organizationId), []).length > 0;
+}
+
 function storeUsageHistory(data) {
-  // Skip write if the session is invalid — a live session always has resets_at timestamps.
-  // Absent timestamps mean the API returned empty/zeroed data (dead session, removed device, etc.)
-  if (!data.five_hour?.resets_at && !data.seven_day?.resets_at) {
+  // Skip write when nothing identifies a live window: charting a zeroed
+  // payload as if it were real usage would flatten the history to 0%.
+  if (isEmptyUsagePayload(data)) {
     debugLog('[History] Skipping write — no reset timestamps, likely invalid session data');
     return;
   }
 
   const organizationId = store.get('organizationId');
-  const historyKey = organizationId ? `usageHistory_${organizationId}` : 'usageHistory';
 
   const timestamp = Date.now();
+  const historyKey = usageHistoryKey(organizationId);
   let history = store.get(historyKey, []);
 
   history.push({
@@ -243,11 +259,41 @@ async function setSessionCookie(sessionKey) {
 // A logout or expired-session cleanup that only clears one of these leaves
 // the encrypted key in place, so it silently comes back on the next launch
 // (main.js's startup credential load reads sessionKey_encrypted first).
-function clearStoredCredentials() {
+// `keepOrgPreference` separates the two very different reasons this runs. An
+// expired session leaves the account unchanged, so forgetting which
+// organization the user was watching is pure loss — worse, it is what let a
+// re-authentication silently move the widget onto another org: the cleanup
+// ran first, so there was no longer a stored org for validate-session-key to
+// keep, and the Teams-first heuristic decided instead. A deliberate logout is
+// the opposite: nothing about the previous account should survive it.
+function clearStoredCredentials({ keepOrgPreference = false } = {}) {
   store.delete('sessionKey');
   store.delete('sessionKey_encrypted');
-  store.delete('organizationId');
   store.delete('sessionKeyExpiresAt');
+
+  // Promote the live org into the preference here, instead of trusting
+  // save-credentials to have already written one. An install that upgrades
+  // into this version has an organizationId but no preference — its owner
+  // never re-entered save-credentials — so "keeping" the preference would
+  // keep a key that doesn't exist, hand the choice straight back to the
+  // heuristic on the very first expiry, and then cement whatever it picked.
+  // That is the incident, reproduced on exactly the population it was meant
+  // to protect. Reading the value at the moment of the wipe needs no
+  // migration and can't go stale.
+  const activeOrgId = store.get('organizationId');
+  if (keepOrgPreference && activeOrgId) {
+    store.set('preferredOrganizationId', activeOrgId);
+  }
+
+  // Always cleared even when the preference is kept: the renderer reads the
+  // presence of organizationId as "credentials present" and would skip the
+  // login screen. The preference lives under its own key for that reason.
+  store.delete('organizationId');
+
+  if (keepOrgPreference) return;
+
+  store.delete('preferredOrganizationId');
+  store.delete('organizations');
 }
 
 function createMainWindow() {
@@ -812,6 +858,15 @@ function formatResetTime(resetsAt, timeFormat, includeDate = false) {
  * Update tray icons with current usage data
  * @param {Object} usageData - Usage data object containing session and weekly percentages
  */
+// The tray icons can only draw a number, and the number they'd draw here is a
+// misleading 0%. When the widget is minimised they are the only surface the
+// user sees, so the tooltip carries what the banner says in the window.
+function trayNoUsageSuffix(usageData) {
+  return usageData?.no_usage_for_org
+    ? '\nNo usage reported for this organization'
+    : '';
+}
+
 function updateTrayIcon(usageData) {
   const showTrayStats = store.get('settings.showTrayStats', false);
   
@@ -866,6 +921,7 @@ function updateTrayIcon(usageData) {
       if (weeklyResetTime) {
         weeklyTooltip += `\nResets: ${weeklyResetTime}`;
       }
+      weeklyTooltip += trayNoUsageSuffix(usageData);
       weeklyTray.setToolTip(weeklyTooltip);
     }
     
@@ -884,6 +940,7 @@ function updateTrayIcon(usageData) {
       if (sessionResetTime) {
         sessionTooltip += `\nResets: ${sessionResetTime}`;
       }
+      sessionTooltip += trayNoUsageSuffix(usageData);
       sessionTray.setToolTip(sessionTooltip);
     }
   } catch (error) {
@@ -897,14 +954,26 @@ ipcMain.handle('get-credentials', () => {
   const sessionKey = loadStoredSessionKey();
   return {
     sessionKey,
-    organizationId: store.get('organizationId')
+    organizationId: store.get('organizationId'),
+    // The org list has to survive a restart: without it the renderer hides
+    // the organization selector, leaving the user no way to correct the
+    // selected org — the one control that fixes a widget stuck on an org
+    // that reports no usage.
+    organizations: store.get('organizations', [])
   };
 });
 
-ipcMain.handle('save-credentials', async (event, { sessionKey, organizationId, expirationDate }) => {
+ipcMain.handle('save-credentials', async (event, { sessionKey, organizationId, organizations, expirationDate }) => {
   persistSessionKey(sessionKey, expirationDate);
+  // The id and the list are committed together, in that order: they must
+  // never disagree about which account they describe.
   if (organizationId) {
     store.set('organizationId', organizationId);
+    // Survives a session-expiry cleanup — see clearStoredCredentials.
+    store.set('preferredOrganizationId', organizationId);
+  }
+  if (Array.isArray(organizations) && organizations.length > 0) {
+    store.set('organizations', organizations);
   }
   // Also set cookie in Electron session for window-based fetching
   await setSessionCookie(sessionKey);
@@ -937,29 +1006,36 @@ ipcMain.handle('validate-session-key', async (event, sessionKey) => {
     const data = await fetchViaWindow('https://claude.ai/api/organizations');
 
     if (data && Array.isArray(data) && data.length > 0) {
-      // Filter to orgs with 'chat' capability (excludes API-only orgs)
-      const chatOrgs = data.filter(org => 
-        org.capabilities && org.capabilities.includes('chat')
-      );
+      // Drops API-only orgs, which have no chat usage to report
+      const chatOrgs = toChatOrgSummaries(data);
 
       if (chatOrgs.length === 0) {
         return { success: false, error: 'No chat-enabled organizations found' };
       }
 
-      // Prioritize Teams org if present, otherwise use first chat org
-      const defaultOrg = chatOrgs.find(org => org.raven_type === 'team') || chatOrgs[0];
-      const orgId = defaultOrg.uuid || defaultOrg.id;
-      
-      debugLog(`Session key validated, found ${chatOrgs.length} chat org(s), default org ID:`, orgId);
-      
-      return { 
-        success: true, 
+      // Keeps whatever org is already in service when the account still has
+      // it — see src/org-selection.js for why that matters more than the
+      // Teams-first default it replaces.
+      const { organizationId: orgId, source: orgSource } = pickOrganizationId(
+        chatOrgs,
+        store.get('organizationId'),
+        store.get('preferredOrganizationId')
+      );
+
+      debugLog(
+        `Session key validated, found ${chatOrgs.length} chat org(s), org ID:`,
+        orgId,
+        `(from: ${orgSource})`
+      );
+
+      // Deliberately does NOT persist anything: validation runs on a candidate
+      // key that may never be committed, and writing the new account's org
+      // list beside the previous account's organizationId would leave the two
+      // describing different accounts. save-credentials commits both together.
+      return {
+        success: true,
         organizationId: orgId,
-        organizations: chatOrgs.map(org => ({
-          id: org.uuid || org.id,
-          name: org.name,
-          isTeam: org.raven_type === 'team'
-        }))
+        organizations: chatOrgs
       };
     }
 
@@ -1607,6 +1683,53 @@ function isNewerVersion(remote, local) {
   } catch { return false; }
 }
 
+// Probed at most once per app run, and only from the empty-payload path — the
+// one case where the org count changes what the widget is allowed to say.
+//
+// Both halves of that budget matter. The empty-payload state is *persistent*
+// by nature, so a per-poll lookup would open a hidden BrowserWindow (30s
+// timeout) every five minutes for as long as it lasted — including when the
+// lookup itself keeps failing. And a purely cached answer would never notice
+// an org list that has changed since, leaving a revoked org in the selector
+// and a stale count behind the warning. One successful probe per launch
+// settles both: fresh once, then free.
+//
+// Only a *success* spends that budget. Burning it on the attempt would let a
+// single transient Cloudflare hiccup disable the warning for the rest of the
+// run — silence being the exact failure this whole change exists to remove —
+// while retrying on every poll is what the budget is there to prevent. A
+// failure therefore backs off rather than giving up.
+const ORG_PROBE_RETRY_MS = 30 * 60 * 1000;
+let orgListProbeSucceeded = false;
+let orgListProbeLastAttempt = 0;
+
+async function listChatOrganizations() {
+  const cached = store.get('organizations', []);
+  if (orgListProbeSucceeded) return cached;
+  if (orgListProbeLastAttempt && (Date.now() - orgListProbeLastAttempt) < ORG_PROBE_RETRY_MS) {
+    return cached;
+  }
+  orgListProbeLastAttempt = Date.now();
+
+  try {
+    const chatOrgs = toChatOrgSummaries(await fetchViaWindow('https://claude.ai/api/organizations'));
+    if (chatOrgs.length > 0) {
+      orgListProbeSucceeded = true;
+      store.set('organizations', chatOrgs);
+      return chatOrgs;
+    }
+    // Unexpected shape or an empty account — keep whatever we already had
+    // rather than erasing a list the user's selector depends on. Not counted
+    // as a success: the next window may answer properly.
+    return cached;
+  } catch (err) {
+    // Not worth surfacing: it only means we can't tell yet whether the org is
+    // the culprit, so the widget keeps its quieter wording until the retry.
+    debugLog('[Usage] Could not list organizations:', err.message);
+    return cached;
+  }
+}
+
 ipcMain.handle('fetch-usage-data', async (event, options = {}) => {
   let sessionKey = loadStoredSessionKey();
   const organizationId = store.get('organizationId');
@@ -1690,7 +1813,9 @@ ipcMain.handle('fetch-usage-data', async (event, options = {}) => {
       || error.message.startsWith('UnexpectedHTML')
       || error.message.startsWith('Unauthorized');
     if (isBlocked) {
-      clearStoredCredentials();
+      // The session died; the account did not. Keep which org the user was
+      // watching so the re-authentication that follows resumes on it.
+      clearStoredCredentials({ keepOrgPreference: true });
       if (mainWindow) {
         mainWindow.webContents.send('session-expired');
       }
@@ -1740,6 +1865,21 @@ ipcMain.handle('fetch-usage-data', async (event, options = {}) => {
     }
   } else {
     debugLog('Prepaid fetch skipped or failed:', prepaidResult.reason?.message || 'no data');
+  }
+
+  // Tell the renderer when a zeroed payload can't be taken at face value, so
+  // it stops presenting "0% — Not started" as an established fact. The rule
+  // itself is in looksLikeWrongOrg; the short-circuit here is only about cost,
+  // since the org count is the one input that needs a hidden BrowserWindow.
+  const emptyPayload = isEmptyUsagePayload(data);
+  const orgHasHistory = orgHasUsageHistory(organizationId);
+  const chatOrgCount = (emptyPayload && !orgHasHistory)
+    ? (await listChatOrganizations()).length
+    : 0;
+
+  if (looksLikeWrongOrg({ emptyPayload, orgHasHistory, chatOrgCount })) {
+    data.no_usage_for_org = true;
+    debugLog('[Usage] Empty payload, no history on org', organizationId, `of ${chatOrgCount} — flagging`);
   }
 
   storeUsageHistory(data);

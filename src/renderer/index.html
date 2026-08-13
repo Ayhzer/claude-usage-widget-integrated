@@ -51,6 +51,13 @@
                 <button class="update-banner-dismiss" id="updateBannerDismiss" title="Dismiss">✕</button>
             </div>
 
+            <!-- No-usage warning (hidden by default). Not dismissible: it
+                 reports a state, not an event, and clears on its own as soon
+                 as the API returns a live usage window again. -->
+            <div class="update-banner warning-banner" id="orgDataBanner" style="display: none;">
+                <span class="update-banner-text warning-banner-text" id="orgDataBannerText"></span>
+            </div>
+
             <!-- Loading State -->
             <div class="loading-container" id="loadingContainer">
                 <div class="spinner"></div>
