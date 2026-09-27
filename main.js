@@ -1327,6 +1327,23 @@ function findRenewalBrowserExecutable() {
   }) || null;
 }
 
+// --disable-extensions: the fresh profile signs in implicitly with the Windows
+// work account, and Edge sync then installs that account's extensions a few
+// seconds after startup. "Claude in Chrome" (fcoeoabgfenejglbffodgkkbkcdhcgfn)
+// opens its own claude.ai OAuth tab on install — a second, seemingly identical
+// login tab the user never asked for. Policy force-installed extensions still
+// load; only user-installed ones are kept out of this throwaway profile.
+function getEdgeRenewalArgs(port, userDataDir) {
+  return [
+    `--remote-debugging-port=${port}`,
+    `--user-data-dir=${userDataDir}`,
+    '--no-first-run',
+    '--no-default-browser-check',
+    '--disable-extensions',
+    'https://claude.ai/login'
+  ];
+}
+
 function getFreePort() {
   return new Promise((resolve, reject) => {
     const probe = net.createServer();
@@ -1474,13 +1491,7 @@ async function attemptEdgeRenewal() {
 
   const port = await getFreePort();
   const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), 'claude-usage-widget-edge-'));
-  const child = spawn(browserPath, [
-    `--remote-debugging-port=${port}`,
-    `--user-data-dir=${tmpDir}`,
-    '--no-first-run',
-    '--no-default-browser-check',
-    'https://claude.ai/login'
-  ], { stdio: 'ignore' });
+  const child = spawn(browserPath, getEdgeRenewalArgs(port, tmpDir), { stdio: 'ignore' });
 
   const state = { child, tmpDir };
   activeEdgeRenewal = state;
