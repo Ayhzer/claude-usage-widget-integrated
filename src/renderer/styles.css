@@ -1307,6 +1307,22 @@ body.theme-light .expand-arrow {
     opacity: 1;
 }
 
+/* Amber variant of the banner, for a warning rather than an update offer.
+   Reuses .update-banner's layout — only the colours change — and drops the
+   pointer/underline affordance since this text isn't clickable. */
+.warning-banner {
+    background: #2a2000;
+}
+
+.warning-banner-text {
+    color: #e0c060;
+    cursor: default;
+}
+
+.warning-banner-text:hover {
+    text-decoration: none;
+}
+
 /* ── Settings version row ──────────────────────────────────── */
 .settings-version-label {
     font-size: 11px;
@@ -1332,6 +1348,17 @@ body.theme-light .update-banner {
 body.theme-light .update-banner-text,
 body.theme-light .update-banner-dismiss {
     color: #4a7a00;
+}
+
+/* Must follow the two rules above, not precede them: the warning banner also
+   carries .update-banner/.update-banner-text, and at equal specificity the
+   later declaration wins — placed earlier, the amber would lose to the green. */
+body.theme-light .warning-banner {
+    background: #fdf3d0;
+}
+
+body.theme-light .warning-banner-text {
+    color: #8a6500;
 }
 
 body.theme-light .settings-version-label {

@@ -1,8 +1,14 @@
 const { app, BrowserWindow, ipcMain, Tray, Menu, session, shell, Notification, safeStorage, nativeImage } = require('electron');
 const path = require('path');
 const https = require('https');
+const http = require('http');
+const net = require('net');
+const { spawn } = require('child_process');
+const WebSocket = require('ws');
 const Store = require('electron-store');
 const { fetchViaWindow, fetchMultipleViaWindow } = require('./src/fetch-via-window');
+const { toChatOrgSummaries, pickOrganizationId } = require('./src/org-selection');
+const { isEmptyUsagePayload, looksLikeWrongOrg } = require('./src/usage-payload');
 
 const GITHUB_OWNER = 'SlavomirDurej';
 const GITHUB_REPO = 'claude-usage-widget';
@@ -52,6 +58,17 @@ function debugLog(...args) {
 
 const CHROME_USER_AGENT = 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36';
 
+// Domains a login/re-auth window is allowed to navigate to — claude.ai plus
+// its supported OAuth/SSO providers. Shared by every window that drives an
+// authentication flow (visible login window, silent refresh window) so the
+// allowlist can't drift between them.
+const ALLOWED_LOGIN_DOMAINS = [
+  'claude.ai',
+  'accounts.google.com',
+  'appleid.apple.com',
+  'login.microsoftonline.com'
+];
+
 let mainWindow = null;
 let sessionTray = null;  // Tray icon for Session usage
 let weeklyTray = null;   // Tray icon for Weekly usage
@@ -62,18 +79,32 @@ const HISTORY_RETENTION_DAYS = 8;
 const CHART_DAYS = 7;
 const MAX_HISTORY_SAMPLES = 10000; // Cap total samples to prevent unbounded growth
 
+// History is namespaced per organization; the bare key is the pre-migration
+// legacy one (see migrateUsageHistoryKey).
+function usageHistoryKey(organizationId) {
+  return organizationId ? `usageHistory_${organizationId}` : 'usageHistory';
+}
+
+// Whether this org has produced any usage the widget still holds. Bounded by
+// HISTORY_RETENTION_DAYS and by pruneStaleHistoryKeys, so it answers "recently"
+// rather than "ever" — which is the useful question: an org that was producing
+// samples until this morning is idle, not wrong.
+function orgHasUsageHistory(organizationId) {
+  return store.get(usageHistoryKey(organizationId), []).length > 0;
+}
+
 function storeUsageHistory(data) {
-  // Skip write if the session is invalid — a live session always has resets_at timestamps.
-  // Absent timestamps mean the API returned empty/zeroed data (dead session, removed device, etc.)
-  if (!data.five_hour?.resets_at && !data.seven_day?.resets_at) {
+  // Skip write when nothing identifies a live window: charting a zeroed
+  // payload as if it were real usage would flatten the history to 0%.
+  if (isEmptyUsagePayload(data)) {
     debugLog('[History] Skipping write — no reset timestamps, likely invalid session data');
     return;
   }
 
   const organizationId = store.get('organizationId');
-  const historyKey = organizationId ? `usageHistory_${organizationId}` : 'usageHistory';
 
   const timestamp = Date.now();
+  const historyKey = usageHistoryKey(organizationId);
   let history = store.get(historyKey, []);
 
   history.push({
@@ -138,8 +169,79 @@ app.on('ready', () => {
   session.defaultSession.setUserAgent(CHROME_USER_AGENT);
 });
 
+// Persist a sessionKey captured from any source (login window, or a live
+// Set-Cookie rotation from claude.ai) using the same encrypted storage as
+// save-credentials, so it survives restarts and stays in sync with whatever
+// claude.ai's browser session currently holds.
+function persistSessionKey(sessionKey, expirationDate) {
+  if (safeStorage.isEncryptionAvailable()) {
+    const encrypted = safeStorage.encryptString(sessionKey);
+    store.set('sessionKey_encrypted', encrypted.toString('base64'));
+    store.delete('sessionKey');
+  } else {
+    store.set('sessionKey', sessionKey);
+  }
+  if (expirationDate) {
+    store.set('sessionKeyExpiresAt', expirationDate);
+  }
+}
+
+// How long before the stored sessionKey's known expiration we attempt a
+// silent refresh (level 3 of the reconnection cascade). Chosen as an
+// absolute margin rather than a percentage of total lifetime: Electron only
+// gives us the expiration timestamp, not when the cookie was issued, so a
+// "90% of lifetime" rule would need extra bookkeeping for no real benefit —
+// a fixed margin catches the 24h org-enforced expiry just as well.
+const SESSION_KEY_REFRESH_MARGIN_MS = 30 * 60 * 1000;
+
+// Read the stored sessionKey back out, decrypting it if safeStorage holds
+// it. Centralizes what was previously four separate copies of the same
+// safeStorage-or-legacy-plaintext lookup, each free to drift from the others.
+function loadStoredSessionKey() {
+  if (safeStorage.isEncryptionAvailable()) {
+    const encrypted = store.get('sessionKey_encrypted');
+    if (!encrypted) return null;
+    try {
+      return safeStorage.decryptString(Buffer.from(encrypted, 'base64'));
+    } catch (err) {
+      console.error('[Keychain] Failed to decrypt session key:', err.message);
+      return null;
+    }
+  }
+  return store.get('sessionKey') || null;
+}
+
+// True once the stored sessionKey is within its refresh margin of expiring,
+// or already past it. False when no expiration is known — cookies set via
+// the manual paste flow don't carry one, so there is nothing to anticipate.
+function isSessionKeyNearExpiry() {
+  const expiresAt = store.get('sessionKeyExpiresAt'); // epoch seconds (Electron cookie format)
+  if (!expiresAt) return false;
+  return (expiresAt * 1000) - Date.now() <= SESSION_KEY_REFRESH_MARGIN_MS;
+}
+
+// Capture sessionKey rotations claude.ai performs on its own (a silent
+// Set-Cookie refresh while the app is running) as soon as they happen.
+// Without this, the next fetch-usage-data call would read the *stale*
+// value from the store and overwrite the freshly-rotated cookie with it —
+// undoing a renewal that had already succeeded.
+app.on('ready', () => {
+  session.defaultSession.cookies.on('changed', (event, cookie, cause, removed) => {
+    if (cookie.name === 'sessionKey' && cookie.domain.includes('claude.ai') && !removed && cookie.value) {
+      persistSessionKey(cookie.value, cookie.expirationDate);
+      debugLog('sessionKey cookie rotation captured, cause:', cause);
+    }
+  });
+});
+
 // Set sessionKey as a cookie in Electron's session
 async function setSessionCookie(sessionKey) {
+  const existing = await session.defaultSession.cookies.get({ url: 'https://claude.ai', name: 'sessionKey' });
+  if (existing.length && existing[0].value === sessionKey) {
+    // Already the current value — skip the redundant write so we don't
+    // clobber a rotation that just landed via the listener above.
+    return;
+  }
   await session.defaultSession.cookies.set({
     url: 'https://claude.ai',
     name: 'sessionKey',
@@ -150,6 +252,48 @@ async function setSessionCookie(sessionKey) {
     httpOnly: true
   });
   debugLog('sessionKey cookie set in Electron session');
+}
+
+// Remove the stored sessionKey from every location it can live in — legacy
+// plaintext, safeStorage-encrypted, and the organizationId that pairs with it.
+// A logout or expired-session cleanup that only clears one of these leaves
+// the encrypted key in place, so it silently comes back on the next launch
+// (main.js's startup credential load reads sessionKey_encrypted first).
+// `keepOrgPreference` separates the two very different reasons this runs. An
+// expired session leaves the account unchanged, so forgetting which
+// organization the user was watching is pure loss — worse, it is what let a
+// re-authentication silently move the widget onto another org: the cleanup
+// ran first, so there was no longer a stored org for validate-session-key to
+// keep, and the Teams-first heuristic decided instead. A deliberate logout is
+// the opposite: nothing about the previous account should survive it.
+function clearStoredCredentials({ keepOrgPreference = false } = {}) {
+  store.delete('sessionKey');
+  store.delete('sessionKey_encrypted');
+  store.delete('sessionKeyExpiresAt');
+
+  // Promote the live org into the preference here, instead of trusting
+  // save-credentials to have already written one. An install that upgrades
+  // into this version has an organizationId but no preference — its owner
+  // never re-entered save-credentials — so "keeping" the preference would
+  // keep a key that doesn't exist, hand the choice straight back to the
+  // heuristic on the very first expiry, and then cement whatever it picked.
+  // That is the incident, reproduced on exactly the population it was meant
+  // to protect. Reading the value at the moment of the wipe needs no
+  // migration and can't go stale.
+  const activeOrgId = store.get('organizationId');
+  if (keepOrgPreference && activeOrgId) {
+    store.set('preferredOrganizationId', activeOrgId);
+  }
+
+  // Always cleared even when the preference is kept: the renderer reads the
+  // presence of organizationId as "credentials present" and would skip the
+  // login screen. The preference lives under its own key for that reason.
+  store.delete('organizationId');
+
+  if (keepOrgPreference) return;
+
+  store.delete('preferredOrganizationId');
+  store.delete('organizations');
 }
 
 function createMainWindow() {
@@ -594,8 +738,7 @@ function createTray() {
       {
         label: 'Log Out',
         click: async () => {
-          store.delete('sessionKey');
-          store.delete('organizationId');
+          clearStoredCredentials();
           // Clear all Claude.ai cookies and session storage
           const cookies = await session.defaultSession.cookies.get({ url: 'https://claude.ai' });
           for (const cookie of cookies) {
@@ -715,6 +858,15 @@ function formatResetTime(resetsAt, timeFormat, includeDate = false) {
  * Update tray icons with current usage data
  * @param {Object} usageData - Usage data object containing session and weekly percentages
  */
+// The tray icons can only draw a number, and the number they'd draw here is a
+// misleading 0%. When the widget is minimised they are the only surface the
+// user sees, so the tooltip carries what the banner says in the window.
+function trayNoUsageSuffix(usageData) {
+  return usageData?.no_usage_for_org
+    ? '\nNo usage reported for this organization'
+    : '';
+}
+
 function updateTrayIcon(usageData) {
   const showTrayStats = store.get('settings.showTrayStats', false);
   
@@ -769,6 +921,7 @@ function updateTrayIcon(usageData) {
       if (weeklyResetTime) {
         weeklyTooltip += `\nResets: ${weeklyResetTime}`;
       }
+      weeklyTooltip += trayNoUsageSuffix(usageData);
       weeklyTray.setToolTip(weeklyTooltip);
     }
     
@@ -787,6 +940,7 @@ function updateTrayIcon(usageData) {
       if (sessionResetTime) {
         sessionTooltip += `\nResets: ${sessionResetTime}`;
       }
+      sessionTooltip += trayNoUsageSuffix(usageData);
       sessionTray.setToolTip(sessionTooltip);
     }
   } catch (error) {
@@ -797,39 +951,29 @@ function updateTrayIcon(usageData) {
 
 // IPC Handlers
 ipcMain.handle('get-credentials', () => {
-  let sessionKey = null;
-  // Try safeStorage first (OS keychain)
-  if (safeStorage.isEncryptionAvailable()) {
-    const encrypted = store.get('sessionKey_encrypted');
-    if (encrypted) {
-      try {
-        sessionKey = safeStorage.decryptString(Buffer.from(encrypted, 'base64'));
-      } catch (err) {
-        console.error('[Keychain] Failed to decrypt session key:', err.message);
-      }
-    }
-  } else {
-    // Fallback: plain storage (legacy or safeStorage unavailable)
-    sessionKey = store.get('sessionKey');
-  }
+  const sessionKey = loadStoredSessionKey();
   return {
     sessionKey,
-    organizationId: store.get('organizationId')
+    organizationId: store.get('organizationId'),
+    // The org list has to survive a restart: without it the renderer hides
+    // the organization selector, leaving the user no way to correct the
+    // selected org — the one control that fixes a widget stuck on an org
+    // that reports no usage.
+    organizations: store.get('organizations', [])
   };
 });
 
-ipcMain.handle('save-credentials', async (event, { sessionKey, organizationId }) => {
-  // Store session key in OS keychain if available
-  if (safeStorage.isEncryptionAvailable()) {
-    const encrypted = safeStorage.encryptString(sessionKey);
-    store.set('sessionKey_encrypted', encrypted.toString('base64'));
-    store.delete('sessionKey'); // Remove legacy plain storage
-  } else {
-    // Fallback: plain storage
-    store.set('sessionKey', sessionKey);
-  }
+ipcMain.handle('save-credentials', async (event, { sessionKey, organizationId, organizations, expirationDate }) => {
+  persistSessionKey(sessionKey, expirationDate);
+  // The id and the list are committed together, in that order: they must
+  // never disagree about which account they describe.
   if (organizationId) {
     store.set('organizationId', organizationId);
+    // Survives a session-expiry cleanup — see clearStoredCredentials.
+    store.set('preferredOrganizationId', organizationId);
+  }
+  if (Array.isArray(organizations) && organizations.length > 0) {
+    store.set('organizations', organizations);
   }
   // Also set cookie in Electron session for window-based fetching
   await setSessionCookie(sessionKey);
@@ -837,9 +981,7 @@ ipcMain.handle('save-credentials', async (event, { sessionKey, organizationId })
 });
 
 ipcMain.handle('delete-credentials', async () => {
-  store.delete('sessionKey');
-  store.delete('sessionKey_encrypted');
-  store.delete('organizationId');
+  clearStoredCredentials();
   // Remove all Claude.ai cookies
   const cookies = await session.defaultSession.cookies.get({ url: 'https://claude.ai' });
   for (const cookie of cookies) {
@@ -856,7 +998,6 @@ ipcMain.handle('delete-credentials', async () => {
 
 // Validate a sessionKey by fetching org ID via hidden BrowserWindow
 ipcMain.handle('validate-session-key', async (event, sessionKey) => {
-  debugLog('Validating session key:', sessionKey.substring(0, 20) + '...');
   try {
     // Set the cookie in Electron's session first
     await setSessionCookie(sessionKey);
@@ -865,29 +1006,36 @@ ipcMain.handle('validate-session-key', async (event, sessionKey) => {
     const data = await fetchViaWindow('https://claude.ai/api/organizations');
 
     if (data && Array.isArray(data) && data.length > 0) {
-      // Filter to orgs with 'chat' capability (excludes API-only orgs)
-      const chatOrgs = data.filter(org => 
-        org.capabilities && org.capabilities.includes('chat')
-      );
+      // Drops API-only orgs, which have no chat usage to report
+      const chatOrgs = toChatOrgSummaries(data);
 
       if (chatOrgs.length === 0) {
         return { success: false, error: 'No chat-enabled organizations found' };
       }
 
-      // Prioritize Teams org if present, otherwise use first chat org
-      const defaultOrg = chatOrgs.find(org => org.raven_type === 'team') || chatOrgs[0];
-      const orgId = defaultOrg.uuid || defaultOrg.id;
-      
-      debugLog(`Session key validated, found ${chatOrgs.length} chat org(s), default org ID:`, orgId);
-      
-      return { 
-        success: true, 
+      // Keeps whatever org is already in service when the account still has
+      // it — see src/org-selection.js for why that matters more than the
+      // Teams-first default it replaces.
+      const { organizationId: orgId, source: orgSource } = pickOrganizationId(
+        chatOrgs,
+        store.get('organizationId'),
+        store.get('preferredOrganizationId')
+      );
+
+      debugLog(
+        `Session key validated, found ${chatOrgs.length} chat org(s), org ID:`,
+        orgId,
+        `(from: ${orgSource})`
+      );
+
+      // Deliberately does NOT persist anything: validation runs on a candidate
+      // key that may never be committed, and writing the new account's org
+      // list beside the previous account's organizationId would leave the two
+      // describing different accounts. save-credentials commits both together.
+      return {
+        success: true,
         organizationId: orgId,
-        organizations: chatOrgs.map(org => ({
-          id: org.uuid || org.id,
-          name: org.name,
-          isTeam: org.raven_type === 'team'
-        }))
+        organizations: chatOrgs
       };
     }
 
@@ -1079,6 +1227,309 @@ ipcMain.handle('save-settings', (event, settings) => {
   return true;
 });
 
+// Level 3 of the reconnection cascade: try to renew the sessionKey without
+// ever showing a window. Loads claude.ai's login page in a hidden
+// BrowserWindow — if the underlying claude.ai/IdP session is still alive,
+// the page redirects straight past /login and drops a fresh sessionKey
+// cookie, captured automatically by the permanent 'changed' listener above.
+// If a login form is shown instead (MFA required, IdP session also dead),
+// we give up silently; the caller falls back to the interactive renewal
+// flows below (level 4a: real-Edge CDP, level 4b: embedded window).
+function attemptSilentRefresh({ timeoutMs = 8000 } = {}) {
+  return new Promise((resolve) => {
+    const win = new BrowserWindow({
+      show: false,
+      webPreferences: {
+        nodeIntegration: false,
+        contextIsolation: true
+      }
+    });
+
+    let settled = false;
+    const finish = (success) => {
+      if (settled) return;
+      settled = true;
+      clearTimeout(timer);
+      if (!win.isDestroyed()) win.close();
+      resolve({ success });
+    };
+
+    const timer = setTimeout(() => finish(false), timeoutMs);
+
+    win.webContents.on('will-navigate', (event, url) => {
+      try {
+        const hostname = new URL(url).hostname;
+        const isAllowed = ALLOWED_LOGIN_DOMAINS.some(domain =>
+          hostname === domain || hostname.endsWith('.' + domain)
+        );
+        if (!isAllowed) event.preventDefault();
+      } catch {
+        event.preventDefault();
+      }
+    });
+
+    win.webContents.setWindowOpenHandler(() => ({ action: 'deny' }));
+
+    // Any navigation that lands away from /login means the IdP session was
+    // still valid and claude.ai let us straight through.
+    const checkUrl = (event, url) => {
+      if (!url.includes('/login')) finish(true);
+    };
+    win.webContents.on('did-navigate', checkUrl);
+    win.webContents.on('did-navigate-in-page', checkUrl);
+
+    win.webContents.on('did-fail-load', () => finish(false));
+
+    win.loadURL('https://claude.ai/login').catch(() => finish(false));
+  });
+}
+
+// Level 4a of the reconnection cascade: renew the sessionKey through a real,
+// external Edge (or Chrome) instance instead of Electron's embedded Chromium.
+// Claude.ai/Cloudflare blocks the embedded login window below (level 4b) but
+// has no reason to flag a genuine, unmodified browser — the user
+// authenticates exactly as they would anyway (MFA included, nothing
+// bypassed). We only ever call the CDP Network domain to read the resulting
+// cookie, never Runtime.enable/Page.enable on the page itself — the usual
+// signal automation-detection scripts look for — so this doesn't add any
+// client-side fingerprint for Cloudflare to see.
+//
+// Deliberately NOT reading Edge/Chrome's cookie database directly: that was
+// tried extensively in this project's history (DPAPI decryption, SQLite
+// WAL/EBUSY file-lock issues, asar packaging) and abandoned as "too fragile
+// and OS-specific" — see src/fetch-via-window.js's header comment. Modern
+// Chromium also wraps that file in App-Bound Encryption specifically to stop
+// this kind of extraction; defeating it would reproduce an infostealer
+// technique, not a legitimate feature. --remote-debugging-port, by contrast,
+// is a sanctioned Chromium feature built for exactly this kind of automation
+// (Playwright/Puppeteer/Selenium all use it).
+const EDGE_RENEWAL_TIMEOUT_MS = 5 * 60 * 1000; // generous — covers a real MFA prompt
+const EDGE_CDP_READY_TIMEOUT_MS = 10000;
+
+function findRenewalBrowserExecutable() {
+  const programFiles = process.env['ProgramFiles'] || 'C:\\Program Files';
+  const programFilesX86 = process.env['ProgramFiles(x86)'] || 'C:\\Program Files (x86)';
+  const localAppData = process.env['LOCALAPPDATA'] || '';
+  const candidates = [
+    path.join(programFiles, 'Microsoft', 'Edge', 'Application', 'msedge.exe'),
+    path.join(programFilesX86, 'Microsoft', 'Edge', 'Application', 'msedge.exe'),
+    path.join(localAppData, 'Microsoft', 'Edge', 'Application', 'msedge.exe'),
+    path.join(programFiles, 'Google', 'Chrome', 'Application', 'chrome.exe'),
+    path.join(programFilesX86, 'Google', 'Chrome', 'Application', 'chrome.exe'),
+    path.join(localAppData, 'Google', 'Chrome', 'Application', 'chrome.exe')
+  ];
+  return candidates.find((candidate) => {
+    try {
+      return fs.existsSync(candidate);
+    } catch {
+      return false;
+    }
+  }) || null;
+}
+
+// --disable-extensions: the fresh profile signs in implicitly with the Windows
+// work account, and Edge sync then installs that account's extensions a few
+// seconds after startup. "Claude in Chrome" (fcoeoabgfenejglbffodgkkbkcdhcgfn)
+// opens its own claude.ai OAuth tab on install — a second, seemingly identical
+// login tab the user never asked for. Policy force-installed extensions still
+// load; only user-installed ones are kept out of this throwaway profile.
+function getEdgeRenewalArgs(port, userDataDir) {
+  return [
+    `--remote-debugging-port=${port}`,
+    `--user-data-dir=${userDataDir}`,
+    '--no-first-run',
+    '--no-default-browser-check',
+    '--disable-extensions',
+    'https://claude.ai/login'
+  ];
+}
+
+function getFreePort() {
+  return new Promise((resolve, reject) => {
+    const probe = net.createServer();
+    probe.on('error', reject);
+    probe.listen(0, '127.0.0.1', () => {
+      const { port } = probe.address();
+      probe.close(() => resolve(port));
+    });
+  });
+}
+
+function httpGetJson(url, timeoutMs) {
+  return new Promise((resolve, reject) => {
+    const req = http.get(url, { timeout: timeoutMs }, (res) => {
+      let body = '';
+      res.on('data', (chunk) => { body += chunk; });
+      res.on('end', () => {
+        try {
+          resolve(JSON.parse(body));
+        } catch (err) {
+          reject(err);
+        }
+      });
+    });
+    req.on('error', reject);
+    req.on('timeout', () => req.destroy(new Error('CDP endpoint request timed out')));
+  });
+}
+
+// Poll the CDP HTTP endpoint until the browser has finished starting up.
+async function waitForCdpVersionInfo(port, timeoutMs) {
+  const deadline = Date.now() + timeoutMs;
+  let lastError;
+  while (Date.now() < deadline) {
+    try {
+      return await httpGetJson(`http://127.0.0.1:${port}/json/version`, 1000);
+    } catch (err) {
+      lastError = err;
+      await new Promise((resolve) => setTimeout(resolve, 300));
+    }
+  }
+  throw lastError || new Error('CDP endpoint did not respond in time');
+}
+
+// Drive the CDP WebSocket from Node directly (the `ws` package), not from a
+// page inside Electron's own Chromium. That was the first approach tried —
+// it fails every time: a page's native WebSocket always sends an `Origin`
+// header, and Chromium's DevTools server rejects any WebSocket handshake
+// that carries one, precisely to stop a malicious webpage from hijacking a
+// locally running browser's remote-debugging port (DNS-rebinding style
+// attack). A bare, non-browser WebSocket client has no Origin header and
+// connects normally — which is exactly why Puppeteer/Playwright drive CDP
+// this way instead of from inside a browser tab.
+function pollSessionKeyViaCdp(webSocketDebuggerUrl, timeoutMs) {
+  return new Promise((resolve) => {
+    const ws = new WebSocket(webSocketDebuggerUrl);
+    let msgId = 1;
+    let settled = false;
+    let pollTimer = null;
+    const pending = new Map();
+
+    const finish = (value) => {
+      if (settled) return;
+      settled = true;
+      clearTimeout(overallTimeout);
+      if (pollTimer) clearInterval(pollTimer);
+      try { ws.close(); } catch {}
+      resolve(value);
+    };
+
+    const overallTimeout = setTimeout(() => finish({ success: false, error: 'timeout' }), timeoutMs);
+
+    function send(method, params) {
+      const id = msgId++;
+      return new Promise((res) => {
+        pending.set(id, res);
+        ws.send(JSON.stringify({ id, method, params: params || {} }));
+      });
+    }
+
+    ws.on('open', () => {
+      pollTimer = setInterval(async () => {
+        if (settled) return;
+        // Network.getCookies requires an attached page session — it doesn't
+        // exist on this session-less browser-level connection (CDP error
+        // -32601). Storage.getCookies is the one Cookie-reading method that
+        // does work at the browser level, which is why it's used here.
+        const reply = await send('Storage.getCookies', {});
+        if (reply && reply.error) {
+          finish({ success: false, error: `CDP: ${reply.error.message}` });
+          return;
+        }
+        const cookies = (reply && reply.cookies) || [];
+        const found = cookies.find((c) => c.name === 'sessionKey' && c.domain.includes('claude.ai') && c.value);
+        if (found) {
+          await send('Storage.clearCookies', {});
+          finish({
+            success: true,
+            sessionKey: found.value,
+            expirationDate: found.expires > 0 ? found.expires : null
+          });
+        }
+      }, 1000);
+    });
+
+    ws.on('message', (data) => {
+      const msg = JSON.parse(data.toString());
+      if (msg.id && pending.has(msg.id)) {
+        pending.get(msg.id)(msg.error ? { error: msg.error } : msg.result);
+        pending.delete(msg.id);
+      }
+    });
+
+    ws.on('error', () => finish({ success: false, error: 'CDP WebSocket error' }));
+    ws.on('close', () => finish({ success: false, error: 'CDP connection closed' }));
+  });
+}
+
+// Tracks the in-flight renewal (if any) so app quit / a second click can
+// clean up the external browser process and its temp profile deterministically.
+let activeEdgeRenewal = null;
+
+function cleanupEdgeRenewal(state) {
+  if (!state) return;
+  try {
+    if (!state.child.killed) state.child.kill();
+  } catch {}
+  try {
+    fs.rmSync(state.tmpDir, { recursive: true, force: true });
+  } catch (err) {
+    debugLog('[EdgeRenewal] Failed to remove temp profile:', err.message);
+  }
+  if (activeEdgeRenewal === state) activeEdgeRenewal = null;
+}
+
+async function attemptEdgeRenewal() {
+  if (activeEdgeRenewal) {
+    return { success: false, error: 'A renewal is already in progress' };
+  }
+
+  const browserPath = findRenewalBrowserExecutable();
+  if (!browserPath) {
+    return { success: false, error: 'Microsoft Edge introuvable — utilisez Manuel' };
+  }
+
+  const port = await getFreePort();
+  const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), 'claude-usage-widget-edge-'));
+  const child = spawn(browserPath, getEdgeRenewalArgs(port, tmpDir), { stdio: 'ignore' });
+
+  const state = { child, tmpDir };
+  activeEdgeRenewal = state;
+
+  let userClosedBrowser = false;
+  child.once('exit', (code, signal) => {
+    debugLog('[EdgeRenewal] child exited, code=', code, 'signal=', signal);
+    userClosedBrowser = true;
+  });
+  child.once('error', (err) => {
+    debugLog('[EdgeRenewal] child spawn error:', err.message);
+    userClosedBrowser = true;
+  });
+
+  try {
+    const versionInfo = await waitForCdpVersionInfo(port, EDGE_CDP_READY_TIMEOUT_MS);
+    const result = await pollSessionKeyViaCdp(versionInfo.webSocketDebuggerUrl, EDGE_RENEWAL_TIMEOUT_MS);
+    debugLog('[EdgeRenewal] renewal result:', result.success, result.error || '');
+
+    if (!result.success) {
+      return { success: false, error: userClosedBrowser ? 'Login window closed' : (result.error || 'Renewal failed') };
+    }
+
+    persistSessionKey(result.sessionKey, result.expirationDate);
+    return { success: true, sessionKey: result.sessionKey, expirationDate: result.expirationDate };
+  } catch (err) {
+    return { success: false, error: userClosedBrowser ? 'Login window closed' : err.message };
+  } finally {
+    cleanupEdgeRenewal(state);
+  }
+}
+
+app.on('before-quit', () => {
+  cleanupEdgeRenewal(activeEdgeRenewal);
+});
+
+ipcMain.handle('renew-via-edge', () => attemptEdgeRenewal());
+
 // Open a visible BrowserWindow for the user to log in to Claude.ai.
 //
 // Why we don't embed login directly in the app:
@@ -1092,11 +1543,13 @@ ipcMain.handle('save-settings', (event, settings) => {
 // providers) to prevent phishing attacks. Popup windows are blocked. Current
 // URL is displayed in the window title bar for transparency.
 ipcMain.handle('detect-session-key', async () => {
-  // Clear any leftover sessionKey cookie
-  try {
-    await session.defaultSession.cookies.remove('https://claude.ai', 'sessionKey');
-  } catch (e) { /* ignore */ }
-
+  // Intentionally does NOT clear the existing sessionKey cookie before
+  // opening the window (see constat 2.4 in PLAN.md): if the underlying
+  // claude.ai/IdP session is still alive, loading /login redirects straight
+  // through and a fresh cookie is captured below without the user having to
+  // do anything. Clearing first would force a full interactive re-auth even
+  // when it isn't needed. If the session really is dead, claude.ai ignores
+  // the stale cookie server-side and shows the login form as normal.
   return new Promise((resolve) => {
     const loginWin = new BrowserWindow({
       width: 1000,
@@ -1110,18 +1563,10 @@ ipcMain.handle('detect-session-key', async () => {
 
     let resolved = false;
 
-    // Security: restrict navigation to trusted domains only
-    const allowedLoginDomains = [
-      'claude.ai',
-      'accounts.google.com',
-      'appleid.apple.com',
-      'login.microsoftonline.com'
-    ];
-
     loginWin.webContents.on('will-navigate', (event, url) => {
       try {
         const hostname = new URL(url).hostname;
-        const isAllowed = allowedLoginDomains.some(domain =>
+        const isAllowed = ALLOWED_LOGIN_DOMAINS.some(domain =>
           hostname === domain || hostname.endsWith('.' + domain)
         );
         if (!isAllowed) {
@@ -1163,7 +1608,7 @@ ipcMain.handle('detect-session-key', async () => {
         resolved = true;
         session.defaultSession.cookies.removeListener('changed', onCookieChanged);
         loginWin.close();
-        resolve({ success: true, sessionKey: cookie.value });
+        resolve({ success: true, sessionKey: cookie.value, expirationDate: cookie.expirationDate });
       }
     };
 
@@ -1249,26 +1694,73 @@ function isNewerVersion(remote, local) {
   } catch { return false; }
 }
 
-ipcMain.handle('fetch-usage-data', async (event, options = {}) => {
-  // Use the same credential retrieval logic as get-credentials
-  let sessionKey = null;
-  if (safeStorage.isEncryptionAvailable()) {
-    const encrypted = store.get('sessionKey_encrypted');
-    if (encrypted) {
-      try {
-        sessionKey = safeStorage.decryptString(Buffer.from(encrypted, 'base64'));
-      } catch (err) {
-        console.error('[Keychain] Failed to decrypt session key:', err.message);
-      }
-    }
-  } else {
-    sessionKey = store.get('sessionKey');
-  }
+// Probed at most once per app run, and only from the empty-payload path — the
+// one case where the org count changes what the widget is allowed to say.
+//
+// Both halves of that budget matter. The empty-payload state is *persistent*
+// by nature, so a per-poll lookup would open a hidden BrowserWindow (30s
+// timeout) every five minutes for as long as it lasted — including when the
+// lookup itself keeps failing. And a purely cached answer would never notice
+// an org list that has changed since, leaving a revoked org in the selector
+// and a stale count behind the warning. One successful probe per launch
+// settles both: fresh once, then free.
+//
+// Only a *success* spends that budget. Burning it on the attempt would let a
+// single transient Cloudflare hiccup disable the warning for the rest of the
+// run — silence being the exact failure this whole change exists to remove —
+// while retrying on every poll is what the budget is there to prevent. A
+// failure therefore backs off rather than giving up.
+const ORG_PROBE_RETRY_MS = 30 * 60 * 1000;
+let orgListProbeSucceeded = false;
+let orgListProbeLastAttempt = 0;
 
+async function listChatOrganizations() {
+  const cached = store.get('organizations', []);
+  if (orgListProbeSucceeded) return cached;
+  if (orgListProbeLastAttempt && (Date.now() - orgListProbeLastAttempt) < ORG_PROBE_RETRY_MS) {
+    return cached;
+  }
+  orgListProbeLastAttempt = Date.now();
+
+  try {
+    const chatOrgs = toChatOrgSummaries(await fetchViaWindow('https://claude.ai/api/organizations'));
+    if (chatOrgs.length > 0) {
+      orgListProbeSucceeded = true;
+      store.set('organizations', chatOrgs);
+      return chatOrgs;
+    }
+    // Unexpected shape or an empty account — keep whatever we already had
+    // rather than erasing a list the user's selector depends on. Not counted
+    // as a success: the next window may answer properly.
+    return cached;
+  } catch (err) {
+    // Not worth surfacing: it only means we can't tell yet whether the org is
+    // the culprit, so the widget keeps its quieter wording until the retry.
+    debugLog('[Usage] Could not list organizations:', err.message);
+    return cached;
+  }
+}
+
+ipcMain.handle('fetch-usage-data', async (event, options = {}) => {
+  let sessionKey = loadStoredSessionKey();
   const organizationId = store.get('organizationId');
 
   if (!sessionKey || !organizationId) {
     throw new Error('Missing credentials');
+  }
+
+  // Anticipate the 24h org-enforced expiry: try a silent renewal before it
+  // actually lapses, so the fetch below runs against a fresh cookie instead
+  // of failing first and only reacting afterwards.
+  if (isSessionKeyNearExpiry()) {
+    try {
+      await attemptSilentRefresh();
+    } catch (err) {
+      debugLog('Silent session refresh attempt failed:', err.message);
+    }
+    // Re-read whatever is now stored — attemptSilentRefresh, if successful,
+    // persisted a fresh key via the permanent cookie listener.
+    sessionKey = loadStoredSessionKey();
   }
 
   // Ensure cookie is set
@@ -1329,10 +1821,12 @@ ipcMain.handle('fetch-usage-data', async (event, options = {}) => {
     debugLog('API request failed:', error.message);
     const isBlocked = error.message.startsWith('CloudflareBlocked')
       || error.message.startsWith('CloudflareChallenge')
-      || error.message.startsWith('UnexpectedHTML');
+      || error.message.startsWith('UnexpectedHTML')
+      || error.message.startsWith('Unauthorized');
     if (isBlocked) {
-      store.delete('sessionKey');
-      store.delete('organizationId');
+      // The session died; the account did not. Keep which org the user was
+      // watching so the re-authentication that follows resumes on it.
+      clearStoredCredentials({ keepOrgPreference: true });
       if (mainWindow) {
         mainWindow.webContents.send('session-expired');
       }
@@ -1384,6 +1878,21 @@ ipcMain.handle('fetch-usage-data', async (event, options = {}) => {
     debugLog('Prepaid fetch skipped or failed:', prepaidResult.reason?.message || 'no data');
   }
 
+  // Tell the renderer when a zeroed payload can't be taken at face value, so
+  // it stops presenting "0% — Not started" as an established fact. The rule
+  // itself is in looksLikeWrongOrg; the short-circuit here is only about cost,
+  // since the org count is the one input that needs a hidden BrowserWindow.
+  const emptyPayload = isEmptyUsagePayload(data);
+  const orgHasHistory = orgHasUsageHistory(organizationId);
+  const chatOrgCount = (emptyPayload && !orgHasHistory)
+    ? (await listChatOrganizations()).length
+    : 0;
+
+  if (looksLikeWrongOrg({ emptyPayload, orgHasHistory, chatOrgCount })) {
+    data.no_usage_for_org = true;
+    debugLog('[Usage] Empty payload, no history on org', organizationId, `of ${chatOrgCount} — flagging`);
+  }
+
   storeUsageHistory(data);
 
   // Store latest usage data for settings refresh
@@ -1408,19 +1917,7 @@ ipcMain.handle('fetch-usage-data', async (event, options = {}) => {
 // App lifecycle
 app.whenReady().then(async () => {
   // Restore session cookie if we have stored credentials
-  let sessionKey = null;
-  if (safeStorage.isEncryptionAvailable()) {
-    const encrypted = store.get('sessionKey_encrypted');
-    if (encrypted) {
-      try {
-        sessionKey = safeStorage.decryptString(Buffer.from(encrypted, 'base64'));
-      } catch (err) {
-        console.error('[Keychain] Failed to decrypt session key on startup:', err.message);
-      }
-    }
-  } else {
-    sessionKey = store.get('sessionKey');
-  }
+  const sessionKey = loadStoredSessionKey();
 
   if (sessionKey) {
     await setSessionCookie(sessionKey);

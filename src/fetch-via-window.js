@@ -27,10 +27,19 @@ const BLOCKED_SIGNATURES = [
 
 /**
  * Parse and validate response body text
- * @param {string} bodyText - Raw body text from the page * @returns {Object} Parsed JSON data
- * @throws {Error} If blocked signatures detected or JSON parsing fails
+ * @param {string} bodyText - Raw body text from the page
+ * @param {number} [httpStatus] - HTTP status code of the navigation that produced this body
+ * @returns {Object} Parsed JSON data
+ * @throws {Error} If the session is unauthorized, blocked signatures detected, or JSON parsing fails
  */
-function parseResponseBody(bodyText) {
+function parseResponseBody(bodyText, httpStatus) {
+  // Check the real HTTP status first: a 401/403 can come back with a clean JSON
+  // body (e.g. {"error": "..."}), which would otherwise slip past the body-sniffing
+  // checks below and be treated as valid usage data.
+  if (httpStatus === 401 || httpStatus === 403) {
+    throw new Error(`Unauthorized:${httpStatus}: ${bodyText.substring(0, 200)}`);
+  }
+
   // Detect known block/failure signatures before attempting JSON parse.
   // This provides explicit errors when Claude.ai modifies their API or CSP.
   for (const sig of BLOCKED_SIGNATURES) {
@@ -69,6 +78,11 @@ function fetchViaWindow(url, { timeoutMs = 30000 } = {}) {
       reject(new Error('Request timeout'));
     }, timeoutMs);
 
+    let lastHttpStatus = null;
+    win.webContents.on('did-navigate', (event, url, httpResponseCode) => {
+      lastHttpStatus = httpResponseCode;
+    });
+
     win.webContents.on('did-finish-load', async () => {
       try {
         const bodyText = await win.webContents.executeJavaScript(
@@ -77,7 +91,7 @@ function fetchViaWindow(url, { timeoutMs = 30000 } = {}) {
         clearTimeout(timeout);
         win.close();
 
-        const data = parseResponseBody(bodyText);
+        const data = parseResponseBody(bodyText, lastHttpStatus);
         resolve(data);
       } catch (err) {
         clearTimeout(timeout);
@@ -120,6 +134,11 @@ function fetchMultipleViaWindow(urls, { timeoutMs = 10000 } = {}) {
     const results = [];
     let currentIndex = 0;
     let currentTimeout = null;
+    let lastHttpStatus = null;
+
+    win.webContents.on('did-navigate', (event, url, httpResponseCode) => {
+      lastHttpStatus = httpResponseCode;
+    });
 
     /**
      * Load the next URL in the sequence
@@ -153,7 +172,7 @@ function fetchMultipleViaWindow(urls, { timeoutMs = 10000 } = {}) {
           currentTimeout = null;
         }
 
-        const data = parseResponseBody(bodyText);
+        const data = parseResponseBody(bodyText, lastHttpStatus);
         results.push(data);
         currentIndex++;
         loadNext();

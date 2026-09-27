@@ -31,6 +31,8 @@ const elements = {
     mainContent: document.getElementById('mainContent'),
     loginStep1: document.getElementById('loginStep1'),
     loginStep2: document.getElementById('loginStep2'),
+    renewEdgeBtn: document.getElementById('renewEdgeBtn'),
+    renewEdgeError: document.getElementById('renewEdgeError'),
     autoDetectBtn: document.getElementById('autoDetectBtn'),
     autoDetectError: document.getElementById('autoDetectError'),
     openBrowserLink: document.getElementById('openBrowserLink'),
@@ -87,6 +89,8 @@ const elements = {
     updateBanner: document.getElementById('updateBanner'),
     updateBannerText: document.getElementById('updateBannerText'),
     updateBannerDismiss: document.getElementById('updateBannerDismiss'),
+    orgDataBanner: document.getElementById('orgDataBanner'),
+    orgDataBannerText: document.getElementById('orgDataBannerText'),
     settingsVersionLabel: document.getElementById('settingsVersionLabel'),
     settingsUpdateLink: document.getElementById('settingsUpdateLink'),
     usageAlertsToggle: document.getElementById('usageAlertsToggle'),
@@ -215,7 +219,12 @@ async function init() {
 
 // Event Listeners
 function setupEventListeners() {
-    // Step 1: Login via BrowserWindow
+    // Step 1: Login via a real external Edge, session key captured over CDP
+    elements.renewEdgeBtn.addEventListener('click', handleRenewViaEdge);
+
+    // Step 1 fallback: login via the embedded BrowserWindow (Claude.ai/Cloudflare
+    // often blocks this one — kept only in case the Edge/CDP path is unavailable,
+    // e.g. an enterprise policy disabling --remote-debugging-port).
     elements.autoDetectBtn.addEventListener('click', handleAutoDetect);
 
     // Step navigation
@@ -356,7 +365,13 @@ function setupEventListeners() {
         if (elements.refreshBtn) elements.refreshBtn.classList.remove('spinning');
     });
 
-    // Listen for session expiration events (403 errors)
+    // Listen for session expiration events (401/403, or a Cloudflare block).
+    // The silent-refresh levels in main.js already had their chance before
+    // this fires, so getting here means reconnecting genuinely needs the
+    // user's session (interactive re-auth, e.g. MFA). Show the login screen
+    // with "Renew in Edge" as the primary action, but don't launch anything
+    // automatically — opening an external browser window without a click
+    // would be surprising.
     window.electronAPI.onSessionExpired(() => {
         debugLog('Session expired event received');
         credentials = { sessionKey: null, organizationId: null };
@@ -458,6 +473,48 @@ async function handleConnect() {
     }
 }
 
+// Handle session renewal via a real external Edge, session key captured
+// automatically over the DevTools Protocol — no manual copy-paste.
+async function handleRenewViaEdge() {
+    elements.renewEdgeBtn.disabled = true;
+    elements.renewEdgeBtn.textContent = 'Opening Edge...';
+    elements.renewEdgeError.textContent = '';
+    elements.autoDetectError.textContent = '';
+
+    try {
+        const result = await window.electronAPI.renewViaEdge();
+        if (!result.success) {
+            elements.renewEdgeError.textContent = result.error || 'Renewal failed';
+            return;
+        }
+
+        elements.renewEdgeBtn.textContent = 'Validating...';
+        const validation = await window.electronAPI.validateSessionKey(result.sessionKey);
+
+        if (validation.success) {
+            credentials = {
+                sessionKey: result.sessionKey,
+                organizationId: validation.organizationId,
+                organizations: validation.organizations || [],
+                expirationDate: result.expirationDate
+            };
+            await window.electronAPI.saveCredentials(credentials);
+            populateOrgSelector(validation.organizations || [], validation.organizationId);
+            showMainContent();
+            await fetchUsageData();
+            startAutoUpdate();
+        } else {
+            elements.renewEdgeError.textContent =
+                'Session invalid. Try again or use Manual →';
+        }
+    } catch (error) {
+        elements.renewEdgeError.textContent = error.message || 'Renewal failed';
+    } finally {
+        elements.renewEdgeBtn.disabled = false;
+        elements.renewEdgeBtn.textContent = 'Renew in Edge';
+    }
+}
+
 // Handle auto-detect from browser cookies
 async function handleAutoDetect() {
     elements.autoDetectBtn.disabled = true;
@@ -479,7 +536,8 @@ async function handleAutoDetect() {
             credentials = {
                 sessionKey: result.sessionKey,
                 organizationId: validation.organizationId,
-                organizations: validation.organizations || []
+                organizations: validation.organizations || [],
+                expirationDate: result.expirationDate
             };
             await window.electronAPI.saveCredentials(credentials);
             populateOrgSelector(validation.organizations || [], validation.organizationId);
@@ -519,6 +577,22 @@ async function fetchUsageData(options = {}) {
         const data = await window.electronAPI.fetchUsageData(options);
         debugLog('Received usage data:', data);
         updateUI(data);
+
+        // main.js may have just learned the org list on this very fetch (it
+        // only probes on the empty-payload path). Pick it up now, otherwise
+        // the warning would name a selector that stays hidden until the next
+        // launch — credentials are read once, at init.
+        //
+        // The condition is "the selector isn't there", not "the list is
+        // empty": a list that predates joining a second org is non-empty and
+        // stale, which is precisely the case that leaves the column hidden.
+        // populateOrgSelector re-hides it below two orgs, so this settles on
+        // its own after one store read.
+        if (data?.no_usage_for_org && elements.orgSelectorCol.style.display === 'none') {
+            const stored = await window.electronAPI.getCredentials();
+            credentials.organizations = stored.organizations || [];
+            populateOrgSelector(credentials.organizations, credentials.organizationId);
+        }
     } catch (error) {
         console.error('Error fetching usage data:', error);
         if (error.message.includes('SessionExpired') || error.message.includes('Unauthorized')) {
@@ -750,7 +824,10 @@ function resizeWidget(bannerVisible) {
     const hasBanner = bannerVisible !== undefined
         ? bannerVisible
         : elements.updateBanner.style.display !== 'none';
-    const bannerOffset = hasBanner ? BANNER_HEIGHT : 0;
+    // The two banners stack, so each one needs its own row of height —
+    // counting only one of them would clip the content below.
+    const hasOrgDataBanner = elements.orgDataBanner.style.display !== 'none';
+    const bannerOffset = (hasBanner ? BANNER_HEIGHT : 0) + (hasOrgDataBanner ? BANNER_HEIGHT : 0);
     const extraCount = elements.extraRows.children.length;
     const expandedOffset = isExpanded && extraCount > 0
         ? EXPAND_OVERHEAD + (extraCount * WIDGET_ROW_HEIGHT)
@@ -764,11 +841,39 @@ function normalizeUsageData(data) {
     return data;
 }
 
+// Surface main.js's warning that the selected organization reports no usage
+// at all. Must run before resizeWidget() so the banner's row of height is
+// counted in the same pass.
+// Worded for the two readings it has to survive: an account that genuinely
+// sent nothing this week, and an organization that isn't the one the usage is
+// charged to. Asserting the second would push an idle user to break a correct
+// configuration, so the message reports the fact and leaves the diagnosis open.
+const ORG_DATA_WARNING = 'No usage reported for this organization — if that looks wrong, check ⚙️ Settings';
+
+function updateOrgDataBanner(data) {
+    const flagged = !!data?.no_usage_for_org;
+
+    // Compact mode is a fixed-height two-bar strip sized by setCompactMode(),
+    // with no room for a banner — it would be clipped rather than shown. A
+    // tooltip on the strip is the one signal that fits without resizing it.
+    if (elements.compactContent) {
+        elements.compactContent.title = flagged ? ORG_DATA_WARNING : '';
+    }
+
+    if (flagged && !isCompactMode) {
+        elements.orgDataBannerText.textContent = `▲  ${ORG_DATA_WARNING}`;
+        elements.orgDataBanner.style.display = 'flex';
+    } else {
+        elements.orgDataBanner.style.display = 'none';
+    }
+}
+
 function updateUI(data) {
     latestUsageData = normalizeUsageData(data);
 
     showMainContent();
     buildExtraRows(data);
+    updateOrgDataBanner(data);
     refreshTimers();
     if (isExpanded) refreshExtraTimers();
     if (!isCompactMode) resizeWidget();
@@ -899,6 +1004,9 @@ function applyCompactMode(compact) {
 
     // Update compact bars if we have data
     if (compact && latestUsageData) updateCompactBars(latestUsageData);
+    // Leaving compact mode makes room for the no-usage banner again — restore
+    // it here rather than leaving the widget quiet until the next refresh.
+    updateOrgDataBanner(latestUsageData);
     if (!compact) resizeWidget();
 
     // Persist graph/expanded state changes caused by compact mode toggle
@@ -1124,10 +1232,17 @@ function formatResetsAt(resetsAt, isWeekly, timeFormat, weeklyDateFormat) {
 // Update circular timer
 function updateTimer(timerElement, textElement, resetsAt, totalMinutes) {
     if (!resetsAt) {
-        textElement.textContent = 'Not started';
+        // No usage window at all. Two very different situations land here and
+        // the payload alone doesn't separate them: an account that has simply
+        // sent nothing, or a selected organization that isn't the one the
+        // usage is charged to. Asserting "Not started" in both cases is what
+        // let a wrong-org widget look perfectly healthy for a full day, so
+        // when main.js says the second case is plausible, say that instead.
+        const noOrgData = !!latestUsageData?.no_usage_for_org;
+        textElement.textContent = noOrgData ? 'No data' : 'Not started';
         textElement.style.opacity = '0.4';
         textElement.style.fontSize = '10px';
-        textElement.title = 'Starts when a message is sent';
+        textElement.title = noOrgData ? ORG_DATA_WARNING : 'Starts when a message is sent';
         timerElement.style.strokeDashoffset = 63;
         return;
     }
@@ -1196,6 +1311,10 @@ function showLoginRequired() {
     // Close any open overlays
     elements.settingsOverlay.style.display = 'none';
     elements.compactSettingsOverlay.style.display = 'none';
+    // Drop the no-usage warning: it points at the Settings button this screen
+    // is about to hide, and the login window's height is a hard-coded 360 that
+    // doesn't account for a banner.
+    elements.orgDataBanner.style.display = 'none';
     // Hide header buttons during login
     elements.settingsBtn.style.display = 'none';
     elements.refreshBtn.style.display = 'none';
